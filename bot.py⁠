@@ -1,0 +1,552 @@
+import sqlite3
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# توكن البوت الخاص بك
+TOKEN = "8868708565:AAFe4guj-tAqB6mI7G_kr-v4O1jjatVhn54"
+
+# ضع معرف حسابك (Chat ID) هنا لاستقبال الطلبات (يمكنك معرفته عبر @userinfobot)
+ADMIN_ID = 0  # <--- استبدل الصفر برقم حسابك الحقيقي
+
+
+# ==================== قاعدة البيانات (SQLite) ====================
+def init_db():
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  # جدول المنتجات
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            price REAL,
+            description TEXT,
+            category TEXT
+        )
+    """)
+  # جدول السلة المؤقتة لكل مستخدم
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cart (
+            user_id INTEGER,
+            product_id INTEGER,
+            quantity INTEGER
+        )
+    """)
+  conn.commit()
+  conn.close()
+
+
+init_db()
+
+
+# ==================== وظائف البوت ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  keyboard = [
+      [InlineKeyboardButton("🛍️ استعراض المنتجات", callback_data="show_categories")],
+      [InlineKeyboardButton("🛒 سلة المشتريات", callback_data="show_cart")],
+  ]
+  # إذا كان المستخدم هو الأدمن، نضيف له زر لوحة التحكم
+  if update.effective_user.id == ADMIN_ID:
+    keyboard.append(
+        [InlineKeyboardButton("⚙️ لوحة التحكم (أدمن)", callback_data="admin_panel")]
+    )
+
+  reply_markup = InlineKeyboardMarkup(keyboard)
+  await update.message.reply_text(
+      "أهلاً بك في متجرنا الإلكتروني! 🌟\nاختر ما يناسبك من القائمة أدناه:",
+      reply_markup=reply_markup,
+  )
+
+
+# عرض الأقسام أو المنتجات
+async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  await query.answer()
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute("SELECT DISTINCT category FROM products")
+  categories = cursor.fetchall()
+  conn.close()
+
+  if not categories:
+    await query.message.edit_text(
+        "عذراً، لا توجد منتجات مضافة حالياً.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 رجوع", callback_data="back_home")]]
+        ),
+    )
+    return
+
+  keyboard = []
+  for cat in categories:
+    keyboard.append(
+        [InlineKeyboardButton(f"📁 {cat[0]}", callback_data=f"cat_{cat[0]}")]
+    )
+  keyboard.append(
+      [InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_home")]
+  )
+
+  await query.message.edit_text(
+      "اختر القسم المطلوب:", reply_markup=InlineKeyboardMarkup(keyboard)
+  )
+
+
+# عرض منتجات قسم معين
+async def show_products_in_cat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+  query = update.callback_query
+  await query.answer()
+  category = query.data.split("_")[1]
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT id, name, price, description FROM products WHERE category = ?",
+      (category,),
+  )
+  products = cursor.fetchall()
+  conn.close()
+
+  keyboard = []
+  for p in products:
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                f"{p[1]} - {p[2]} ر.س", callback_data=f"prod_{p[0]}"
+            )
+        ]
+    )
+  keyboard.append(
+      [InlineKeyboardButton("🔙 رجوع للأقسام", callback_data="show_categories")]
+  )
+
+  await query.message.edit_text(
+      f"منتجات قسم {category}:", reply_markup=InlineKeyboardMarkup(keyboard)
+  )
+
+
+# عرض تفاصيل منتج وزر إضافته للسلة
+async def product_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  await query.answer()
+  prod_id = int(query.data.split("_")[1])
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT name, price, description, category FROM products WHERE id = ?",
+      (prod_id,),
+  )
+  prod = cursor.fetchone()
+  conn.close()
+
+  if not prod:
+    await query.message.edit_text("المنتج غير موجود.")
+    return
+
+  text = f"📦 **{prod[0]}**\n\n📝 الوصف: {prod[2]}\n💰 السعر: {prod[1]} ر.س"
+  keyboard = [
+      [
+          InlineKeyboardButton(
+              "➕ إضافة إلى السلة", callback_data=f"add_cart_{prod_id}"
+          )
+      ],
+      [
+          InlineKeyboardButton(
+              "🔙 رجوع للقسم", callback_data=f"cat_{prod[3]}"
+          )
+      ],
+  ]
+
+  await query.message.edit_text(
+      text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+  )
+
+
+# إضافة منتج للسلة
+async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  await query.answer("تمت الإضافة إلى السلة بنجاح! 🛒")
+  prod_id = int(query.data.split("_")[2])
+  user_id = update.effective_user.id
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT quantity FROM cart WHERE user_id = ? AND product_id = ?",
+      (user_id, prod_id),
+  )
+  item = cursor.fetchone()
+
+  if item:
+    cursor.execute(
+        "UPDATE cart SET quantity = quantity + 1 WHERE user_id = ? AND"
+        " product_id = ?",
+        (user_id, prod_id),
+    )
+  else:
+    cursor.execute(
+        "INSERT INTO cart (user_id, product_id, quantity) VALUES (?, ?, 1)",
+        (user_id, prod_id),
+    )
+
+  conn.commit()
+  conn.close()
+
+
+# عرض سلة المشتريات
+async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  await query.answer()
+  user_id = update.effective_user.id
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute(
+      """
+        SELECT p.id, p.name, p.price, c.quantity 
+        FROM cart c JOIN products p ON c.product_id = p.id 
+        WHERE c.user_id = ?
+    """,
+      (user_id,),
+  )
+  items = cursor.fetchall()
+  conn.close()
+
+  if not items:
+    await query.message.edit_text(
+        "🛒 سلة المشتريات فارغة حالياً.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_home")]]
+        ),
+    )
+    return
+
+  text = "🛒 **محتويات سلتك:**\n\n"
+  total = 0
+  keyboard = []
+
+  for item in items:
+    subtotal = item[2] * item[3]
+    total += subtotal
+    text += f"• {item[1]} (العدد: {item[3]}) - السعر: {subtotal} ر.س\n"
+    keyboard.append([
+        InlineKeyboardButton(
+            f"❌ حذف {item[1]}", callback_data=f"del_cart_{item[0]}"
+        )
+    ])
+
+  text += f"\n💰 **الإجمالي الكلي: {total} ر.س**"
+
+  keyboard.append(
+      [InlineKeyboardButton("✅ إتمام الطلب", callback_data="checkout")]
+  )
+  keyboard.append(
+      [InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_home")]
+  )
+
+  await query.message.edit_text(
+      text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+  )
+
+
+# حذف منتج من السلة
+async def delete_from_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  await query.answer("تم الحذف من السلة")
+  prod_id = int(query.data.split("_")[2])
+  user_id = update.effective_user.id
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute(
+      "DELETE FROM cart WHERE user_id = ? AND product_id = ?",
+      (user_id, prod_id),
+  )
+  conn.commit()
+  conn.close()
+
+  await show_cart(update, context)
+
+
+# إتمام الطلب
+async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  await query.answer()
+  context.user_data["waiting_for_name"] = True
+
+  await query.message.reply_text(
+      "📝 يرجى إرسال **اسمك الثلاثي** لإتمام الطلب:",
+      parse_mode="Markdown",
+      reply_markup=InlineKeyboardMarkup(
+          [[InlineKeyboardButton("❌ إلغاء", callback_data="back_home")]]
+      ),
+  )
+
+
+# استقبال الاسم وإرسال الطلب للأدمن
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  if context.user_data.get("waiting_for_name"):
+    name = update.message.text
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    username_str = f"@{username}" if username else "بدون معرف"
+
+    conn = sqlite3.connect("store.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+            SELECT p.name, p.price, c.quantity 
+            FROM cart c JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = ?
+        """,
+        (user_id,),
+    )
+    items = cursor.fetchall()
+
+    if not items:
+      await update.message.reply_text("سلتك فارغة!")
+      context.user_data["waiting_for_name"] = False
+      return
+
+    order_details = (
+        f"🚨 **طلب جديد وارد!**\n\n👤 اسم العميل: {name}\n🔗 معرف تيليجرام:"
+        f" {username_str} (ID: {user_id})\n\n📦 **المنتجات المطلوبة:**\n"
+    )
+    total = 0
+    for item in items:
+      sub = item[1] * item[2]
+      total += sub
+      order_details += (
+          f"- {item[0]} | الكمية: {item[2]} | السعر: {sub} ر.س\n"
+      )
+
+    order_details += f"\n💰 **المجموع الكلي: {total} ر.س**"
+
+    cursor.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+    context.user_data["waiting_for_name"] = False
+
+    if ADMIN_ID != 0:
+      try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID, text=order_details, parse_mode="Markdown"
+        )
+      except Exception as e:
+        print(f"فشل إرسال الطلب للأدمن: {e}")
+
+    await update.message.reply_text(
+        "✅ تم إرسال طلبك بنجاح! سيتم التواصل معك قريباً.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 الرئيسية", callback_data="back_home")]]
+        ),
+    )
+
+
+# لوحة تحكم الأدمن
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  if update.effective_user.id != ADMIN_ID:
+    await query.answer("هذا القسم خاص بالأدمن فقط!", show_alert=True)
+    return
+
+  await query.answer()
+  keyboard = [
+      [
+          InlineKeyboardButton(
+              "➕ إضافة منتج جديد", callback_data="admin_add_prod"
+          )
+      ],
+      [
+          InlineKeyboardButton(
+              "🗑️ حذف منتج", callback_data="admin_del_prod_list"
+          )
+      ],
+      [InlineKeyboardButton("🔙 رجوع للرئيسية", callback_data="back_home")],
+  ]
+  await query.message.edit_text(
+      "⚙️ **لوحة تحكم المشرف:**",
+      parse_mode="Markdown",
+      reply_markup=InlineKeyboardMarkup(keyboard),
+  )
+
+
+async def admin_add_prod_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+  query = update.callback_query
+  await query.answer()
+  context.user_data["adding_product"] = True
+
+  await query.message.reply_text(
+      "أرسل تفاصيل المنتج الجديد بهذا الشكل تماماً في رسالة واحدة:\n\n"
+      "الاسم, السعر, الوصف, القسم\n\n"
+      "مثال:\n"
+      "سماعة بلوتوث, 150, سماعة لاسلكية ممتازة وعملية, إلكترونيات",
+      reply_markup=InlineKeyboardMarkup(
+          [[InlineKeyboardButton("❌ إلغاء", callback_data="admin_panel")]]
+      ),
+  )
+
+
+async def handle_admin_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+  if (
+      context.user_data.get("adding_product")
+      and update.effective_user.id == ADMIN_ID
+  ):
+    text = update.message.text
+    try:
+      parts = [p.strip() for p in text.split(",")]
+      if len(parts) < 4:
+        raise ValueError("بيانات ناقصة")
+
+      name, price, desc, category = parts[0], float(parts[1]), parts[2], parts[3]
+
+      conn = sqlite3.connect("store.db")
+      cursor = conn.cursor()
+      cursor.execute(
+          "INSERT INTO products (name, price, description, category) VALUES"
+          " (?, ?, ?, ?)",
+          (name, price, desc, category),
+      )
+      conn.commit()
+      conn.close()
+
+      context.user_data["adding_product"] = False
+      await update.message.reply_text(
+          "✅ تمت إضافة المنتج بنجاح!",
+          reply_markup=InlineKeyboardMarkup(
+              [[InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")]]
+          ),
+      )
+    except Exception:
+      await update.message.reply_text(
+          "❌ حدث خطأ في تنسيق البيانات. تأكد من استخدام الفاصلة (,) بالشكل"
+          " الصحيح وأعد المحاولة."
+      )
+
+
+async def admin_del_prod_list(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+  query = update.callback_query
+  await query.answer()
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute("SELECT id, name FROM products")
+  products = cursor.fetchall()
+  conn.close()
+
+  if not products:
+    await query.message.edit_text(
+        "لا توجد منتجات لحذفها.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 لوحة التحكم", callback_data="admin_panel")]]
+        ),
+    )
+    return
+
+  keyboard = []
+  for p in products:
+    keyboard.append([
+        InlineKeyboardButton(
+            f"🗑️ حذف: {p[1]}", callback_data=f"admin_rm_{p[0]}"
+        )
+    ])
+  keyboard.append(
+      [InlineKeyboardButton("🔙 لوحة التحكم", callback_data="admin_panel")]
+  )
+
+  await query.message.edit_text(
+      "اختر المنتج المراد حذفه:", reply_markup=InlineKeyboardMarkup(keyboard)
+  )
+
+
+async def admin_remove_product(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+  query = update.callback_query
+  await query.answer("تم حذف المنتج")
+  prod_id = int(query.data.split("_")[2])
+
+  conn = sqlite3.connect("store.db")
+  cursor = conn.cursor()
+  cursor.execute("DELETE FROM products WHERE id = ?", (prod_id,))
+  conn.commit()
+  conn.close()
+
+  await admin_del_prod_list(update, context)
+
+
+async def back_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  query = update.callback_query
+  await query.answer()
+  context.user_data["waiting_for_name"] = False
+  context.user_data["adding_product"] = False
+
+  keyboard = [
+      [InlineKeyboardButton("🛍️ استعراض المنتجات", callback_data="show_categories")],
+      [InlineKeyboardButton("🛒 سلة المشتريات", callback_data="show_cart")],
+  ]
+  if update.effective_user.id == ADMIN_ID:
+    keyboard.append(
+        [InlineKeyboardButton("⚙️ لوحة التحكم (أدمن)", callback_data="admin_panel")]
+    )
+
+  await query.message.edit_text(
+      "القائمة الرئيسية:", reply_markup=InlineKeyboardMarkup(keyboard)
+  )
+
+
+def main():
+  app = ApplicationBuilder().token(TOKEN).build()
+
+  app.add_handler(CommandHandler("start", start))
+  app.add_handler(CallbackQueryHandler(show_categories, pattern="^show_categories$"))
+  app.add_handler(CallbackQueryHandler(show_products_in_cat, pattern="^cat_"))
+  app.add_handler(CallbackQueryHandler(product_detail, pattern="^prod_"))
+  app.add_handler(CallbackQueryHandler(add_to_cart, pattern="^add_cart_"))
+  app.add_handler(CallbackQueryHandler(show_cart, pattern="^show_cart$"))
+  app.add_handler(CallbackQueryHandler(delete_from_cart, pattern="^del_cart_"))
+  app.add_handler(CallbackQueryHandler(checkout, pattern="^checkout$"))
+  app.add_handler(CallbackQueryHandler(back_home, pattern="^back_home$"))
+
+  app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
+  app.add_handler(
+      CallbackQueryHandler(admin_add_prod_start, pattern="^admin_add_prod$")
+  )
+  app.add_handler(
+      CallbackQueryHandler(admin_del_prod_list, pattern="^admin_del_prod_list$")
+  )
+  app.add_handler(
+      CallbackQueryHandler(admin_remove_product, pattern="^admin_rm_")
+  )
+
+  app.add_handler(
+      MessageHandler(
+          filters.TEXT & ~filters.COMMAND,
+          lambda u, c: handle_message(u, c)
+          if c.user_data.get("waiting_for_name")
+          else handle_admin_input(u, c),
+      )
+  )
+
+  print("البوت يعمل الآن بنجاح...")
+  app.run_polling()
+
+
+if __name__ == "__main__":
+  main()
